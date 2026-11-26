@@ -705,7 +705,7 @@ VOID VioGpuAllocation::CreateBlob(UINT ctx_id)
 
     if (IsCreated()) return;
 
-    bool ok = m_adapter->ctrlQueue.CreateResourceBlob(m_Id, ctx_id, &m_Blob.Options, m_Size);
+    bool ok = m_adapter->ctrlQueue.CreateResourceBlob(m_Id, ctx_id, &m_Blob.Options, m_adapter->AlignBlobSize(m_Size));
     m_Blob.Created = ok;
 }
 

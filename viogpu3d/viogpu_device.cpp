@@ -818,7 +818,8 @@ VioGpuDeviceAllocation::VioGpuDeviceAllocation(VioGpuDevice *device, VioGpuAlloc
                                        create_ctx,
                                        device->m_Context.GetCapset(),
                                        allocation->m_Blob.Options.blob_id));
-        bool ok = m_pDevice->GetCtrlQueue()->CreateResourceBlob(m_pAllocation->GetId(), create_ctx, &m_pAllocation->m_Blob.Options, m_pAllocation->m_Size);
+        ULONGLONG size = m_pAllocation->m_adapter->AlignBlobSize(m_pAllocation->m_Size);
+        bool ok = m_pDevice->GetCtrlQueue()->CreateResourceBlob(m_pAllocation->GetId(), create_ctx, &m_pAllocation->m_Blob.Options, size);
         m_pAllocation->m_Blob.Created = ok;
     }
 

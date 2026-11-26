@@ -1545,7 +1545,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                 KIRQL irql;
                 KeAcquireSpinLock(&m_PendingCreateLock, &irql);
                 pVioGpuEscape->ShmemInfo.TotalBytes = m_VioDev.shmem.available ? m_VioDev.shmem.length : 0;
-                pVioGpuEscape->ShmemInfo.UsedBytes = (ULONGLONG)m_ShmemUsedPages << PAGE_SHIFT;
+                pVioGpuEscape->ShmemInfo.UsedBytes = (ULONGLONG)m_ShmemUsedUnits << m_ShmemUnitShift;
                 KeReleaseSpinLock(&m_PendingCreateLock, irql);
                 break;
             }
@@ -3047,6 +3047,27 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
         AckFeature(VIRTIO_GPU_F_VIRGL);
         AckFeature(VIRTIO_GPU_F_RESOURCE_BLOB);
 
+        // A host that can map blobs into the shmem window only at a coarser
+        // granularity than the guest page (16 KiB on Apple silicon) names it
+        // in blob_alignment.  An unusable value leaves the feature off.
+        m_BlobAlignment = 0;
+        if (virtio_is_feature_enabled(m_u64GuestFeatures, VIRTIO_GPU_F_RESOURCE_BLOB) &&
+            virtio_is_feature_enabled(m_u64HostFeatures, VIRTIO_GPU_F_BLOB_ALIGNMENT))
+        {
+            UINT32 alignment = 0;
+            virtio_get_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, blob_alignment), &alignment, sizeof(alignment));
+            if (alignment >= PAGE_SIZE && alignment <= VIOGPU_MAX_BLOB_ALIGNMENT && (alignment & (alignment - 1)) == 0)
+            {
+                AckFeature(VIRTIO_GPU_F_BLOB_ALIGNMENT);
+                m_BlobAlignment = alignment;
+                DbgPrint(TRACE_LEVEL_INFORMATION, ("%s blob_alignment %u\n", __FUNCTION__, alignment));
+            }
+            else
+            {
+                DbgPrint(TRACE_LEVEL_WARNING, ("%s ignoring blob_alignment %u\n", __FUNCTION__, alignment));
+            }
+        }
+
         status = virtio_set_features(&m_VioDev, m_u64GuestFeatures);
         if (!NT_SUCCESS(status))
         {
@@ -3847,13 +3868,14 @@ VioGpuAllocation *VioGpuAdapter::CookieMapLookup(ULONGLONG cookie)
     return found;
 }
 
+ULONG VioGpuAdapter::ShmemUnits(SIZE_T size)
+{
+    ULONG units = (ULONG)((size + ((SIZE_T)1 << m_ShmemUnitShift) - 1) >> m_ShmemUnitShift);
+    return units == 0 ? 1 : units;
+}
+
 ULONGLONG VioGpuAdapter::ShmemAlloc(SIZE_T size)
 {
-    ULONG pages = (ULONG)((size + PAGE_SIZE - 1) >> PAGE_SHIFT);
-    if (pages == 0)
-    {
-        pages = 1;
-    }
     KIRQL irql;
     KeAcquireSpinLock(&m_PendingCreateLock, &irql);
     if (m_ShmemBitmapBuffer == NULL)
@@ -3863,21 +3885,25 @@ ULONGLONG VioGpuAdapter::ShmemAlloc(SIZE_T size)
             KeReleaseSpinLock(&m_PendingCreateLock, irql);
             return (ULONGLONG)-1;
         }
-        ULONG pageCount = (ULONG)(m_VioDev.shmem.length >> PAGE_SHIFT);
-        ULONG bytes = ((pageCount + 31) / 32) * sizeof(ULONG);
+        // One bit per page, or per blob_alignment when the host asked for
+        // one, so that every offset handed out is aligned to it.
+        m_ShmemUnitShift = m_BlobAlignment != 0 ? RtlFindMostSignificantBit(m_BlobAlignment) : PAGE_SHIFT;
+        ULONG unitCount = (ULONG)(m_VioDev.shmem.length >> m_ShmemUnitShift);
+        ULONG bytes = ((unitCount + 31) / 32) * sizeof(ULONG);
         m_ShmemBitmapBuffer = (PULONG)ExAllocatePoolZero(NonPagedPoolNx, bytes, VIOGPUTAG);
         if (m_ShmemBitmapBuffer == NULL)
         {
             KeReleaseSpinLock(&m_PendingCreateLock, irql);
             return (ULONGLONG)-1;
         }
-        m_ShmemPageCount = pageCount;
-        RtlInitializeBitMap(&m_ShmemBitmap, m_ShmemBitmapBuffer, pageCount);
+        m_ShmemUnitCount = unitCount;
+        RtlInitializeBitMap(&m_ShmemBitmap, m_ShmemBitmapBuffer, unitCount);
         // Keep the low window clear of KMD grants: VidMm placements and host
         // bookkeeping both start at 0, so handing out offsets from halfway up
         // the window keeps the two allocators apart.
-        m_ShmemSearchBase = pageCount / 2;
+        m_ShmemSearchBase = unitCount / 2;
     }
+    ULONG units = ShmemUnits(size);
     // First fit from a FIXED base, never from a rolling bump pointer.  The
     // bitmap recycles freed space either way, but a hint that only advances
     // hands every allocation a BAR window this boot has never mapped, and the
@@ -3887,14 +3913,14 @@ ULONGLONG VioGpuAdapter::ShmemAlloc(SIZE_T size)
     // ranges ever mapped -- enough to degrade heap create/destroy ~12x after a
     // few hundred of them, for the rest of the boot.  First fit keeps a
     // churning workload inside one small window; the search stays under 1 us.
-    ULONG index = RtlFindClearBitsAndSet(&m_ShmemBitmap, pages, m_ShmemSearchBase);
+    ULONG index = RtlFindClearBitsAndSet(&m_ShmemBitmap, units, m_ShmemSearchBase);
     if (index == 0xFFFFFFFF)
     {
-        index = RtlFindClearBitsAndSet(&m_ShmemBitmap, pages, 0);
+        index = RtlFindClearBitsAndSet(&m_ShmemBitmap, units, 0);
     }
     if (index != 0xFFFFFFFF)
     {
-        m_ShmemUsedPages += pages;
+        m_ShmemUsedUnits += units;
     }
     KeReleaseSpinLock(&m_PendingCreateLock, irql);
     if (index == 0xFFFFFFFF)
@@ -3902,23 +3928,19 @@ ULONGLONG VioGpuAdapter::ShmemAlloc(SIZE_T size)
         DbgPrint(TRACE_LEVEL_ERROR, ("%s no space for %zu bytes\n", __FUNCTION__, size));
         return (ULONGLONG)-1;
     }
-    return (ULONGLONG)index << PAGE_SHIFT;
+    return (ULONGLONG)index << m_ShmemUnitShift;
 }
 
 VOID VioGpuAdapter::ShmemFree(ULONGLONG offset, SIZE_T size)
 {
-    ULONG pages = (ULONG)((size + PAGE_SIZE - 1) >> PAGE_SHIFT);
-    if (pages == 0)
-    {
-        pages = 1;
-    }
-    ULONG index = (ULONG)(offset >> PAGE_SHIFT);
+    ULONG units = ShmemUnits(size);
+    ULONG index = (ULONG)(offset >> m_ShmemUnitShift);
     KIRQL irql;
     KeAcquireSpinLock(&m_PendingCreateLock, &irql);
-    if (m_ShmemBitmapBuffer != NULL && index + pages <= m_ShmemPageCount)
+    if (m_ShmemBitmapBuffer != NULL && index + units <= m_ShmemUnitCount)
     {
-        RtlClearBits(&m_ShmemBitmap, index, pages);
-        m_ShmemUsedPages -= min(pages, m_ShmemUsedPages);
+        RtlClearBits(&m_ShmemBitmap, index, units);
+        m_ShmemUsedUnits -= min(units, m_ShmemUsedUnits);
     }
     KeReleaseSpinLock(&m_PendingCreateLock, irql);
 }

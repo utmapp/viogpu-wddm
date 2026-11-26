@@ -47,6 +47,9 @@
 #define VIOGPU_WDDM2_PT_INDEX_BITS 9
 #define VIOGPU_WDDM2_PT_SIZE       4096
 
+// The largest blob_alignment honoured, a 2 MiB large page.
+#define VIOGPU_MAX_BLOB_ALIGNMENT  (2 * 1024 * 1024)
+
 #pragma pack(push)
 #pragma pack(1)
 typedef struct
@@ -87,6 +90,8 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     UINT32 m_u32NumCapsets;
     UINT32 m_u32NumScanouts;
     UINT64 m_supportedCapsetIDs;
+    // blob_alignment when VIRTIO_GPU_F_BLOB_ALIGNMENT is negotiated, else 0.
+    ULONG m_BlobAlignment = 0;
 
     // Per-scanout last-reported connect state, indexed by ChildUid.
     // UpdateChildStatus dedupes against this so DXGK only sees real
@@ -98,6 +103,13 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
             return 0;
         }
         return m_PciResources.GetPciBar(m_VioDev.shmem.bar)->GetPA().QuadPart + m_VioDev.shmem.offset;
+    }
+
+    // The size RESOURCE_CREATE_BLOB sends: rounded up to blob_alignment, as
+    // the feature requires.  The guest still maps only the size it asked for.
+    ULONGLONG AlignBlobSize(ULONGLONG size) const
+    {
+        return m_BlobAlignment != 0 ? (size + m_BlobAlignment - 1) & ~((ULONGLONG)m_BlobAlignment - 1) : size;
     }
 
     static const ULONGLONG SHMEM_GPU_BASE_VA = 0x700000000;
@@ -272,10 +284,10 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     // unvalidated and can race another process destroying the allocation.
     VioGpuAllocation *EscapeAllocationRef(ULONGLONG cookie, D3DKMT_HANDLE handle);
 
-    // KMD-owned shmem window suballocation, page granularity.  VidMm never
-    // commits host-backed blobs into the shmem segment under GpuMmu, so the
-    // KMD hands out offsets itself and maps BAR+offset into the UMD process
-    // during the RES_INFO escape.
+    // KMD-owned shmem window suballocation, page or blob_alignment
+    // granularity.  VidMm never commits host-backed blobs into the shmem
+    // segment under GpuMmu, so the KMD hands out offsets itself and maps
+    // BAR+offset into the UMD process during the RES_INFO escape.
     ULONGLONG ShmemAlloc(SIZE_T size);
     VOID ShmemFree(ULONGLONG offset, SIZE_T size);
 
@@ -294,11 +306,13 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     // Shmem suballocator, lazy-initialized on first ShmemAlloc.
     RTL_BITMAP m_ShmemBitmap;
     PULONG m_ShmemBitmapBuffer = NULL;
-    ULONG m_ShmemPageCount = 0;
-    ULONG m_ShmemUsedPages = 0;
+    ULONG m_ShmemUnitShift = PAGE_SHIFT;
+    ULONG m_ShmemUnitCount = 0;
+    ULONG m_ShmemUsedUnits = 0;
     // Where every ShmemAlloc search starts.  Deliberately a FIXED base,
     // not a rolling bump pointer -- see ShmemAlloc.
     ULONG m_ShmemSearchBase = 0;
+    ULONG ShmemUnits(SIZE_T size);
 
     PHYSICAL_ADDRESS GetFrameBufferPA(void)
     {
